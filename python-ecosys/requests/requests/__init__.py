@@ -269,11 +269,11 @@ def request(
             return request(method, redirect, data, json, headers, stream, ssl=ssl)
     else:
         if chunked:
-            resp = Response(BodyStream(s, -1))
-        elif remaining is not None:
-            resp = Response(BodyStream(s, remaining))
-        else:
-            resp = Response(s)
+            remaining = -1
+        if method == "HEAD":
+            # A response to HEAD has no body, whatever its headers say.
+            remaining = 0
+        resp = Response(s if remaining is None else BodyStream(s, remaining))
         resp.status_code = status
         resp.reason = reason
         if resp_d is not None:

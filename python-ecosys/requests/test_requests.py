@@ -500,6 +500,15 @@ def test_redirect_lowercase_location():
     socket.socket = lambda *a, **k: Socket()
 
 
+def test_head_has_no_body():
+    for header in (b"Content-Length: 5\r\n", b"Transfer-Encoding: chunked\r\n"):
+        socket.socket = lambda *a, **k: Socket(b"HTTP/1.1 200 OK\r\n" + header + b"\r\n")
+        response = requests.head("http://example.com")
+        assert response.content == b"", response.content
+
+    socket.socket = lambda *a, **k: Socket()
+
+
 def test_content_length_lowercase_header():
     socket.socket = lambda *a, **k: Socket(
         read_data=b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello"
@@ -540,4 +549,5 @@ test_redirect_absolute()
 test_redirect_relative()
 test_chunked_response_lowercase_header()
 test_redirect_lowercase_location()
+test_head_has_no_body()
 test_content_length_lowercase_header()
