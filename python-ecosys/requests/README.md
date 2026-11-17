@@ -51,6 +51,24 @@ with requests.get("https://example.com", ssl=ctx) as r:
 * Firmware that freezes ``requests`` uses the frozen copy ahead of one
   installed in ``/lib``.
 
+### Redirects
+
+Redirects (301, 302, 303, 307 and 308) to an absolute URL, or to a path
+such as ``/next``, are followed up to 30 times; one more raises
+``ValueError``. After a 301, 302 or 303, the request is sent again as a
+GET without a body, unless it's a HEAD. After a 307 or 308, it's sent
+again with the same method and body. A body given as a generator has
+already been read by then, so it's sent empty.
+
+A ``parse_headers`` callable is called with the header lines of every
+response, redirects included. ``.headers`` is the dict it filled for the
+last one.
+
+As in CPython requests, ``Authorization`` is dropped when a redirect
+changes the scheme, the host or the port, except from http to https on the
+default ports. Header names are matched as written, so give it as
+``Authorization`` in ``headers``.
+
 ### Follow-up work
 
 * Verifying certificates by default, which needs a source of root

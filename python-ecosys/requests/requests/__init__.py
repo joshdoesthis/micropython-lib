@@ -100,7 +100,6 @@ def request(
     else:
         headers = headers.copy()
 
-    redirect = None  # redirection url, None means no redirection
     chunked_data = data and getattr(data, "__next__", None) and not getattr(data, "__len__", None)
 
     if auth is not None:
@@ -111,174 +110,196 @@ def request(
         formatted = str(binascii.b2a_base64(formatted)[:-1], "ascii")
         headers["Authorization"] = "Basic {}".format(formatted)
 
-    try:
-        proto, dummy, host, path = url.split("/", 3)
-    except ValueError:
-        proto, dummy, host = url.split("/", 2)
-        path = ""
-    if proto == "http:":
-        port = 80
-    elif proto == "https:":
-        import tls
+    origin = None  # scheme, host and port of the request that was redirected
+    # The first request, then up to 30 redirects, as in CPython requests.
+    for _ in range(31):
+        redirect = None  # redirection url, None means no redirection
+        try:
+            proto, dummy, host, path = url.split("/", 3)
+        except ValueError:
+            proto, dummy, host = url.split("/", 2)
+            path = ""
+        if proto == "http:":
+            port = 80
+        elif proto == "https:":
+            import tls
 
-        port = 443
-    else:
-        raise ValueError("Unsupported protocol: " + proto)
+            port = 443
+        else:
+            raise ValueError("Unsupported protocol: " + proto)
 
-    if ssl is not None and proto != "https:":
-        # A request that asked for a verified connection never goes out without
-        # one, including when a redirect points to http://.
-        raise ValueError("ssl needs https")
+        if ssl is not None and proto != "https:":
+            # A request that asked for a verified connection never goes out without
+            # one, including when a redirect points to http://.
+            raise ValueError("ssl needs https")
 
-    if "?" in host:
-        host, _path = host.split("?", 1)
-        path = "?" + _path + path
+        if "?" in host:
+            host, _path = host.split("?", 1)
+            path = "?" + _path + path
 
-    if "#" in host:
-        host, _path = host.split("#", 1)
-        path = "#" + _path + path
+        if "#" in host:
+            host, _path = host.split("#", 1)
+            path = "#" + _path + path
 
-    if ":" in host:
-        host, port = host.split(":", 1)
-        port = int(port)
+        if ":" in host:
+            host, port = host.split(":", 1)
+            port = int(port)
 
-    ai = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
-    ai = ai[0]
+        # As in CPython requests, keep Authorization on a redirect only to the
+        # same scheme, host and port, or from http to https on the default ports.
+        if (
+            origin
+            and origin != (proto, host, port)
+            and (origin, proto, port) != (("http:", host, 80), "https:", 443)
+        ):
+            headers.pop("Authorization", None)
 
-    resp_d = None
-    if parse_headers is not False:
-        resp_d = {}
+        ai = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+        ai = ai[0]
 
-    s = socket.socket(ai[0], socket.SOCK_STREAM, ai[2])
+        resp_d = None
+        if parse_headers is not False:
+            resp_d = {}
 
-    if timeout is not None:
-        # Note: settimeout is not supported on all platforms, will raise
-        # an AttributeError if not available.
-        s.settimeout(timeout)
+        s = socket.socket(ai[0], socket.SOCK_STREAM, ai[2])
 
-    try:
-        s.connect(ai[-1])
-        if proto == "https:":
-            context = ssl
-            if context is None:
-                context = tls.SSLContext(tls.PROTOCOL_TLS_CLIENT)
-                context.verify_mode = tls.CERT_NONE
-            s = context.wrap_socket(s, server_hostname=host)
-        s.write(b"%s /%s HTTP/1.1\r\n" % (method, path))
+        if timeout is not None:
+            # Note: settimeout is not supported on all platforms, will raise
+            # an AttributeError if not available.
+            s.settimeout(timeout)
 
-        if "Host" not in headers:
-            headers["Host"] = host
+        try:
+            s.connect(ai[-1])
+            if proto == "https:":
+                context = ssl
+                if context is None:
+                    context = tls.SSLContext(tls.PROTOCOL_TLS_CLIENT)
+                    context.verify_mode = tls.CERT_NONE
+                s = context.wrap_socket(s, server_hostname=host)
+            s.write(b"%s /%s HTTP/1.1\r\n" % (method, path))
 
-        if json is not None:
-            assert data is None
-            from json import dumps
+            if "Host" not in headers:
+                headers["Host"] = host
 
-            data = dumps(json)
+            if json is not None:
+                assert data is None
+                from json import dumps
 
-            if "Content-Type" not in headers:
-                headers["Content-Type"] = "application/json"
+                data = dumps(json)
+                json = None
 
-        if data:
-            if chunked_data:
-                if "Transfer-Encoding" not in headers and "Content-Length" not in headers:
-                    headers["Transfer-Encoding"] = "chunked"
-            else:
-                if isinstance(data, str):
-                    data = bytes(data, "utf-8")
-                if "Content-Length" not in headers:
-                    headers["Content-Length"] = str(len(data))
+                if "Content-Type" not in headers:
+                    headers["Content-Type"] = "application/json"
 
-        if "Connection" not in headers:
-            headers["Connection"] = "close"
+            if data:
+                if chunked_data:
+                    if "Transfer-Encoding" not in headers and "Content-Length" not in headers:
+                        headers["Transfer-Encoding"] = "chunked"
+                else:
+                    if isinstance(data, str):
+                        data = bytes(data, "utf-8")
+                    if "Content-Length" not in headers:
+                        headers["Content-Length"] = str(len(data))
 
-        # Iterate over keys to avoid tuple alloc
-        for k in headers:
-            s.write(k)
-            s.write(b": ")
-            s.write(headers[k])
+            if "Connection" not in headers:
+                headers["Connection"] = "close"
+
+            # Iterate over keys to avoid tuple alloc
+            for k in headers:
+                s.write(k)
+                s.write(b": ")
+                s.write(headers[k])
+                s.write(b"\r\n")
+
             s.write(b"\r\n")
 
-        s.write(b"\r\n")
-
-        if data:
-            if chunked_data:
-                if headers.get("Transfer-Encoding", None) == "chunked":
-                    for chunk in data:
-                        s.write(b"%x\r\n" % len(chunk))
-                        s.write(chunk)
-                        s.write(b"\r\n")
-                    s.write("0\r\n\r\n")
+            if data:
+                if chunked_data:
+                    if headers.get("Transfer-Encoding", None) == "chunked":
+                        for chunk in data:
+                            s.write(b"%x\r\n" % len(chunk))
+                            s.write(chunk)
+                            s.write(b"\r\n")
+                        s.write("0\r\n\r\n")
+                    else:
+                        for chunk in data:
+                            s.write(chunk)
                 else:
-                    for chunk in data:
-                        s.write(chunk)
-            else:
-                s.write(data)
+                    s.write(data)
 
-        l = s.readline()
-        # print(l)
-        l = l.split(None, 2)
-        if len(l) < 2:
-            # Invalid response
-            raise ValueError("HTTP error: BadStatusLine:\n%s" % l)
-        status = int(l[1])
-        reason = ""
-        if len(l) > 2:
-            reason = l[2].rstrip()
-        remaining = None
-        chunked = False
-        while True:
             l = s.readline()
-            if not l or l == b"\r\n":
-                break
             # print(l)
-            lowerl = l.lower()
-            if lowerl.startswith(b"transfer-encoding:"):
-                if b"chunked" in l:
-                    chunked = True
-            elif lowerl.startswith(b"location:") and not 200 <= status <= 299:
-                if status in [301, 302, 303, 307, 308]:
-                    redirect = str(l[10:-2], "utf-8")
-                    if redirect.startswith("/"):
-                        redirect = proto + "//" + host + ":" + str(port) + redirect
+            l = l.split(None, 2)
+            if len(l) < 2:
+                # Invalid response
+                raise ValueError("HTTP error: BadStatusLine:\n%s" % l)
+            status = int(l[1])
+            reason = ""
+            if len(l) > 2:
+                reason = l[2].rstrip()
+            remaining = None
+            chunked = False
+            while True:
+                l = s.readline()
+                if not l or l == b"\r\n":
+                    break
+                # print(l)
+                lowerl = l.lower()
+                if lowerl.startswith(b"transfer-encoding:"):
+                    if b"chunked" in l:
+                        chunked = True
+                elif lowerl.startswith(b"location:") and not 200 <= status <= 299:
+                    if status in [301, 302, 303, 307, 308]:
+                        redirect = str(l[10:-2], "utf-8")
+                        if redirect.startswith("/"):
+                            redirect = proto + "//" + host + ":" + str(port) + redirect
+                    else:
+                        raise NotImplementedError("Redirect %d not yet supported" % status)
+                if parse_headers is False:
+                    pass
+                elif parse_headers is True:
+                    l = str(l, "utf-8")
+                    k, v = l.split(":", 1)
+                    v = v.strip()
+                    resp_d[k] = v
+                    if lowerl.startswith(b"content-length:"):
+                        remaining = int(v)
                 else:
-                    raise NotImplementedError("Redirect %d not yet supported" % status)
-            if parse_headers is False:
-                pass
-            elif parse_headers is True:
-                l = str(l, "utf-8")
-                k, v = l.split(":", 1)
-                v = v.strip()
-                resp_d[k] = v
-                if lowerl.startswith(b"content-length:"):
-                    remaining = int(v)
-            else:
-                parse_headers(l, resp_d)
-    except:
-        # Close the socket whatever went wrong: a certificate that fails
-        # verification raises ValueError, and running out of memory MemoryError.
-        s.close()
-        raise
+                    parse_headers(l, resp_d)
+        except:
+            # Close the socket whatever went wrong: a certificate that fails
+            # verification raises ValueError, and running out of memory MemoryError.
+            s.close()
+            raise
 
-    if redirect:
+        if not redirect:
+            break
         s.close()
         # Use the host specified in the redirect URL, as it may not be the same as the original URL.
         headers.pop("Host", None)
-        if status in [301, 302, 303]:
-            return request("GET", redirect, None, None, headers, stream, ssl=ssl)
-        else:
-            return request(method, redirect, data, json, headers, stream, ssl=ssl)
+        if status in [301, 302, 303] and method != "HEAD":
+            # Follow with a GET that has no body, so drop the headers describing it.
+            headers.pop("Content-Length", None)
+            headers.pop("Content-Type", None)
+            headers.pop("Transfer-Encoding", None)
+            method = "GET"
+            data = None
+        url = redirect
+        origin = (proto, host, port)
     else:
-        if chunked:
-            remaining = -1
-        if method == "HEAD":
-            # A response to HEAD has no body, whatever its headers say.
-            remaining = 0
-        resp = Response(s if remaining is None else BodyStream(s, remaining))
-        resp.status_code = status
-        resp.reason = reason
-        if resp_d is not None:
-            resp.headers = resp_d
-        return resp
+        raise ValueError("Too many redirects")
+
+    if chunked:
+        remaining = -1
+    if method == "HEAD":
+        # A response to HEAD has no body, whatever its headers say.
+        remaining = 0
+    resp = Response(s if remaining is None else BodyStream(s, remaining))
+    resp.status_code = status
+    resp.reason = reason
+    if resp_d is not None:
+        resp.headers = resp_d
+    return resp
 
 
 def head(url, **kw):

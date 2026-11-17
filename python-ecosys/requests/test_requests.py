@@ -8,9 +8,14 @@ class Socket:
     def __init__(self, read_data=SERVER_RESPONSE_200_OK):
         self._write_buffer = io.BytesIO()
         self._read_buffer = io.BytesIO(read_data)
+        self.timeout = None
+        self.closed = False
 
     def connect(self, address):
         pass
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
 
     def write(self, buf):
         self._write_buffer.write(buf)
@@ -25,7 +30,7 @@ class Socket:
         return self._read_buffer.readinto(buf)
 
     def close(self):
-        pass
+        self.closed = True
 
 
 class socket:
@@ -500,6 +505,187 @@ def test_redirect_lowercase_location():
     socket.socket = lambda *a, **k: Socket()
 
 
+def serve(*responses):
+    # Each socket made reads the next response. Returns the sockets made.
+    sockets = []
+    responses = iter(responses)
+
+    def make(*a, **k):
+        sockets.append(Socket(next(responses)))
+        return sockets[-1]
+
+    socket.socket = make
+    return sockets
+
+
+def sent(sockets):
+    return [s._write_buffer.getvalue() for s in sockets]
+
+
+def found(location):
+    return b"HTTP/1.1 302 Found\r\nLocation: " + location + b"\r\n\r\n"
+
+
+def test_redirect_auth_stays_on_the_same_origin():
+    # As in CPython requests, Authorization is kept only when the scheme, host
+    # and port stay the same, or from http to https on the default ports.
+    for url, location, kept in (
+        ("http://example.com", b"/next", True),
+        ("http://example.com", b"http://example.com:80/next", True),
+        ("https://example.com:443", b"https://example.com/next", True),
+        ("http://example.com", b"https://example.com/next", True),
+        ("http://example.com", b"http://other.example.com/next", False),
+        ("http://example.com", b"https://other.example.com/next", False),
+        ("http://example.com", b"http://example.com:8080/next", False),
+        ("http://example.com", b"https://example.com:8443/next", False),
+        ("http://example.com:8080", b"https://example.com/next", False),
+        ("https://example.com", b"http://example.com/next", False),
+        ("https://example.com", b"https://example.com:8443/next", False),
+    ):
+        sockets = serve(found(location), SERVER_RESPONSE_200_OK)
+        requests.get(url, auth=("user", "pass"))
+        first, second = sent(sockets)
+        assert b"Authorization: Basic" in first, first
+        assert (b"Authorization" in second) == kept, (url, location, second)
+
+    # Each redirect is judged against the request it came from, and once
+    # dropped, Authorization stays dropped, from auth= or from headers=.
+    for kw, chain, kept in (
+        (
+            {"auth": ("user", "pass")},
+            (b"https://example.com/", b"http://example.com/"),
+            [True, True, False],
+        ),
+        (
+            {"auth": ("user", "pass")},
+            (b"http://other.example.com/", b"/again"),
+            [True, False, False],
+        ),
+        (
+            {"headers": {"Authorization": "Bearer token"}},
+            (b"http://other.example.com/", b"http://example.com/"),
+            [True, False, False],
+        ),
+    ):
+        sockets = serve(*[found(l) for l in chain] + [SERVER_RESPONSE_200_OK])
+        requests.get("http://example.com", **kw)
+        assert [b"Authorization" in s for s in sent(sockets)] == kept, (kw, chain)
+
+    socket.socket = lambda *a, **k: Socket()
+
+
+def test_redirect_keeps_timeout_and_parse_headers():
+    sockets = serve(found(b"/next"), b"HTTP/1.1 200 OK\r\nX-Final: 1\r\n\r\n")
+    lines = []
+
+    requests.get("http://example.com", timeout=2, parse_headers=lambda l, d: lines.append(l))
+
+    assert [s.timeout for s in sockets] == [2, 2], [s.timeout for s in sockets]
+    assert lines == [b"Location: /next\r\n", b"X-Final: 1\r\n"], lines
+
+    serve(found(b"/next"), SERVER_RESPONSE_200_OK)
+    assert not hasattr(requests.get("http://example.com", parse_headers=False), "headers")
+
+    socket.socket = lambda *a, **k: Socket()
+
+
+def test_redirect_to_get_drops_the_body_headers():
+    def chunks():
+        yield "body"
+
+    for status in (b"301", b"302", b"303"):
+        for kw in (
+            {"data": "body"},
+            {"json": {"a": 1}},
+            {"data": chunks()},
+            {"data": "body", "headers": {"Content-Type": "text/plain"}},
+        ):
+            sockets = serve(
+                b"HTTP/1.1 " + status + b" Moved\r\nLocation: /next\r\n\r\n",
+                SERVER_RESPONSE_200_OK,
+            )
+            requests.post("http://example.com", **kw)
+            second = sent(sockets)[1]
+            assert second.startswith(b"GET /next HTTP/1.1\r\n"), second
+            assert second.endswith(b"\r\n\r\n"), second
+            for name in (b"Content-Length", b"Content-Type", b"Transfer-Encoding"):
+                assert name not in second, (status, kw, second)
+
+    socket.socket = lambda *a, **k: Socket()
+
+
+def test_redirect_keeps_head():
+    # As in CPython requests, a 301, 302 or 303 doesn't turn HEAD into GET.
+    for status in (b"301", b"302", b"303"):
+        sockets = serve(
+            b"HTTP/1.1 " + status + b" Moved\r\nLocation: /next\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+        )
+        response = requests.head("http://example.com")
+        assert sent(sockets)[1].startswith(b"HEAD /next HTTP/1.1\r\n"), sent(sockets)[1]
+        assert response.content == b"", response.content
+
+    socket.socket = lambda *a, **k: Socket()
+
+
+def test_redirect_307_and_308_resend_json():
+    for status in (b"307", b"308"):
+        sockets = serve(
+            b"HTTP/1.1 " + status + b" Temporary Redirect\r\nLocation: /next\r\n\r\n",
+            SERVER_RESPONSE_200_OK,
+        )
+        requests.post("http://example.com", json={"a": 1})
+        first, second = sent(sockets)
+        assert second.startswith(b"POST /next HTTP/1.1\r\n"), second
+        assert b"Content-Type: application/json\r\n" in second, second
+        assert b"Content-Length: 8\r\n" in second, second
+        assert second.endswith(b'\r\n\r\n{"a": 1}'), second
+
+    socket.socket = lambda *a, **k: Socket()
+
+
+def test_redirect_limit():
+    # As in CPython requests, follow at most 30 redirects.
+    loop = found(b"/loop")
+    sockets = []
+    socket.socket = lambda *a, **k: sockets.append(Socket(loop)) or sockets[-1]
+    try:
+        requests.get("http://example.com")
+    except ValueError:
+        pass
+    else:
+        assert False, "expected ValueError"
+    assert len(sockets) == 31, len(sockets)
+    assert all(s.closed for s in sockets)
+
+    sockets = serve(*([loop] * 30 + [SERVER_RESPONSE_200_OK]))
+    assert requests.get("http://example.com").status_code == 200
+    assert len(sockets) == 31, len(sockets)
+
+    socket.socket = lambda *a, **k: Socket()
+
+
+def test_redirect_lets_go_of_the_socket():
+    # The socket of a redirect response mustn't be kept while the redirect is
+    # followed: over TLS, each one holds memory.
+    import gc
+
+    free = []
+
+    def make(*a, **k):
+        gc.collect()
+        free.append(gc.mem_free())
+        s = Socket(SERVER_RESPONSE_200_OK if len(free) > 10 else found(b"/"))
+        s.ballast = bytearray(64000)
+        return s
+
+    socket.socket = make
+    requests.get("http://example.com")
+    assert free[0] - free[-1] < 192000, free
+
+    socket.socket = lambda *a, **k: Socket()
+
+
 def test_head_has_no_body():
     for header in (b"Content-Length: 5\r\n", b"Transfer-Encoding: chunked\r\n"):
         socket.socket = lambda *a, **k: Socket(b"HTTP/1.1 200 OK\r\n" + header + b"\r\n")
@@ -549,5 +735,12 @@ test_redirect_absolute()
 test_redirect_relative()
 test_chunked_response_lowercase_header()
 test_redirect_lowercase_location()
+test_redirect_auth_stays_on_the_same_origin()
+test_redirect_keeps_timeout_and_parse_headers()
+test_redirect_to_get_drops_the_body_headers()
+test_redirect_keeps_head()
+test_redirect_307_and_308_resend_json()
+test_redirect_limit()
+test_redirect_lets_go_of_the_socket()
 test_head_has_no_body()
 test_content_length_lowercase_header()
